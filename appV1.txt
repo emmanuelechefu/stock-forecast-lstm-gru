@@ -1,0 +1,172 @@
+# app.py
+# Streamlit app: Stock forecasting with LSTM/GRU
+
+import streamlit as st
+import numpy as np
+import pandas as pd
+from datetime import date, timedelta
+import matplotlib.pyplot as plt
+
+from src.data_loader import download_stock_data
+from src.preprocessing import preprocess_data
+from src.model_builder import build_lstm_model, build_gru_model
+from src.train import train_model
+
+# --------- App config ----------
+st.set_page_config(page_title="Stock Forecast (LSTM/GRU)", layout="wide")
+st.title("📈 Stock Price Forecast — LSTM / GRU")
+
+# --------- Sidebar controls ----------
+with st.sidebar:
+    st.header("Controls")
+    ticker = st.text_input("Ticker", value="AAPL", help="e.g. AAPL, MSFT, TSLA")
+    years_back = st.slider("Years of history", 1, 10, 5)
+    window = st.slider("Lookback window (days)", 10, 180, 60, step=5)
+    model_type = st.selectbox("Model type", ["LSTM", "GRU"])
+    epochs = st.slider("Training epochs", 5, 200, 25, step=5)
+    batch_size = st.select_slider("Batch size", options=[16, 32, 64, 128], value=32)
+    forecast_steps = st.slider("Future forecast (trading days)", 5, 120, 30, step=5)
+    run_btn = st.button("▶️ Train & Forecast")
+
+st.write(
+    "This app downloads recent data from Yahoo Finance, trains a small recurrent network, "
+    "evaluates on a hold-out set, and forecasts forward."
+)
+
+# --------- Helpers ----------
+@st.cache_data(show_spinner=False)
+def get_data(ticker: str, years_back: int) -> pd.DataFrame:
+    end_date = date.today().isoformat()
+    start_date = (date.today() - timedelta(days=years_back * 365)).isoformat()
+
+    df = download_stock_data(ticker, start_date, end_date)  # returns OHLCV-ish
+    # --- flatten any MultiIndex columns defensively ---
+    if isinstance(df.columns, pd.MultiIndex):
+        # keep only the first level names like 'Close', 'Volume', ...
+        df.columns = df.columns.get_level_values(0)
+    df.columns.name = None
+    df = df.dropna()
+    # keep only what we need for the current pipeline
+    keep = [c for c in df.columns if c.lower() in ("close", "volume")]
+    return df[keep].copy()
+
+def forecast_future(model, close_series: pd.Series, scaler, window: int, steps: int):
+    # Scale full close series to get last window in scaled space
+    scaled_full = scaler.transform(close_series.values.reshape(-1, 1))  # (N,1)
+    window_seq = scaled_full[-window:].copy()                           # (window,1)
+    preds_scaled = []
+    for _ in range(steps):
+        x_input = window_seq.reshape(1, window, 1)  # (1, window, features)
+        next_scaled = model.predict(x_input, verbose=0)[0, 0]
+        preds_scaled.append(next_scaled)
+        # slide forward
+        window_seq = np.vstack([window_seq[1:], [[next_scaled]]])
+    preds = np.array(preds_scaled).reshape(-1, 1)
+    preds = scaler.inverse_transform(preds).ravel()
+    return preds
+
+# --------- Main run ----------
+if run_btn:
+    try:
+        with st.spinner("📥 Downloading data..."):
+            data = get_data(ticker, years_back)
+        st.success(f"Loaded {ticker}: {data.index.min().date()} → {data.index.max().date()} ({len(data)} rows)")
+        st.line_chart(data[['Close']].rename(columns={'Close': f'{ticker} Close'}))
+
+        # Preprocess (Close only for simplicity and clean inverse scaling)
+        from src.preprocessing import preprocess_data
+        X, y, scaler = preprocess_data(data[['Close']], sequence_length=window)
+
+        # Train/test split
+        train_size = int(len(X) * 0.8)
+        X_train, X_test = X[:train_size], X[train_size:]
+        y_train, y_test = y[:train_size], y[train_size:]
+
+        # Build model
+        if model_type.lower() == "gru":
+            model = build_gru_model((X.shape[1], X.shape[2]))
+        else:
+            model = build_lstm_model((X.shape[1], X.shape[2]))
+
+        st.write("### Model Summary")
+        # Show a compact summary in text
+        from contextlib import redirect_stdout
+        import io
+        s = io.StringIO()
+        with redirect_stdout(s):
+            model.summary()
+        st.code(s.getvalue(), language="text")
+
+        # Train
+        st.write("### Training")
+        with st.spinner("🧠 Training model..."):
+            history = train_model(model, X_train, y_train, X_test, y_test, epochs=epochs, batch_size=batch_size)
+
+        # Plot training curves
+        fig_loss, ax_loss = plt.subplots(figsize=(6,3))
+        ax_loss.plot(history.history['loss'], label='train')
+        ax_loss.plot(history.history['val_loss'], label='val')
+        ax_loss.set_title('Loss over epochs')
+        ax_loss.set_xlabel('Epoch'); ax_loss.set_ylabel('MSE'); ax_loss.legend()
+        st.pyplot(fig_loss)
+
+        # Evaluate on test
+        st.write("### Evaluation (hold-out test)")
+        pred_test = model.predict(X_test)
+        # Inverse scale
+        pred_test_inv = scaler.inverse_transform(pred_test)[:, 0]
+        y_test_inv = scaler.inverse_transform(y_test.reshape(-1,1))[:, 0]
+
+        # Plot actual vs predicted
+        fig_eval, ax_eval = plt.subplots(figsize=(10,4))
+        ax_eval.plot(y_test_inv, label='Actual', linewidth=1)
+        ax_eval.plot(pred_test_inv, label='Predicted', linewidth=1)
+        ax_eval.set_title(f'{ticker} — Test Set: Actual vs Predicted')
+        ax_eval.set_xlabel('Test Samples (chronological)'); ax_eval.set_ylabel('Price')
+        ax_eval.legend()
+        st.pyplot(fig_eval)
+
+        # Metrics
+        from sklearn.metrics import mean_squared_error as mse, mean_absolute_error
+        import numpy as np
+
+        # compatible RMSE: works with old/new sklearn
+        try:
+            rmse = mse(y_test_inv, pred_test_inv, squared=False)  # newer sklearn
+        except TypeError:
+            rmse = float(np.sqrt(mse(y_test_inv, pred_test_inv)))  # fallback for older sklearn
+
+        mae  = float(mean_absolute_error(y_test_inv, pred_test_inv))
+
+        st.write(f"**RMSE:** {rmse:.2f}   |   **MAE:** {mae:.2f}")
+        
+
+        # Forecast future
+        st.write("### Future Forecast")
+        future_prices = forecast_future(model, data['Close'], scaler, window, forecast_steps)
+        last_date = data.index[-1]
+        future_dates = pd.bdate_range(last_date + pd.Timedelta(days=1), periods=forecast_steps)
+        future_df = pd.DataFrame({'Forecast': future_prices}, index=future_dates)
+
+        # Plot history + forecast
+        fig_fc, ax_fc = plt.subplots(figsize=(12,4))
+        tail = data['Close'].iloc[-250:]  # last ~250 trading days for context
+        ax_fc.plot(tail.index, tail.values, label='History')
+        ax_fc.plot(future_df.index, future_df['Forecast'], label='Forecast')
+        ax_fc.set_title(f'{ticker} — {model_type.upper()} {forecast_steps}-Day Forecast')
+        ax_fc.set_xlabel('Date'); ax_fc.set_ylabel('Price'); ax_fc.legend()
+        st.pyplot(fig_fc)
+
+        # Show data tables if desired
+        with st.expander("Show raw data"):
+            st.dataframe(data.tail(20))
+        with st.expander("Show future forecast table"):
+            st.dataframe(future_df)
+
+        st.success("Done ✅")
+
+    except Exception as e:
+        st.error(f"Something went wrong: {e}")
+        st.exception(e)
+else:
+    st.info("Set parameters in the sidebar and press **Train & Forecast**.")
